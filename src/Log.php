@@ -2,83 +2,276 @@
 
 namespace WPSPCORE\Log;
 
-use Monolog\Logger as MonologLogger;
-use Monolog\Handler\StreamHandler;
-use Monolog\Handler\RotatingFileHandler;
 use Monolog\Formatter\LineFormatter;
+use Monolog\Handler\RotatingFileHandler;
+use Monolog\Handler\StreamHandler;
+use Monolog\Handler\SyslogHandler;
+use Monolog\Level;
+use Monolog\Logger as MonologLogger;
+use WPSPCORE\Base\BaseInstances;
+use WPSPCORE\Events\Event\Dispatcher;
 
-class Log {
+/**
+ * @property array<string, MonologLogger> $channels
+ * @property Dispatcher|null              $events
+ */
+class Log extends BaseInstances {
 
-	protected static ?MonologLogger $logger  = null;
-	protected static string         $path    = '';
-	protected static string         $channel = 'default';
-	protected static int            $days    = 14;
+	protected $config;
+	protected $events   = null;
+	protected $channels = [];
+	protected $defaultChannel;
+
+	protected $selectedChannel = null;
+
+	public function afterConstruct() {
+		$this->config         = $this->loadConfig();
+		$this->defaultChannel = $this->config['default'] ?? 'stack';
+		$this->events         = $this->funcs->getEvents();
+	}
+
+	// ----------------------------------------------------------------------
+	// Instance API
+	// ----------------------------------------------------------------------
+
+	public function write($level, $message, $context = [], $channel = null) {
+		$channelName = $channel ?? $this->selectedChannel ?? $this->defaultChannel;
+		$logger      = $this->get($channelName);
+
+		// Event: before write
+		$this->dispatch('logging.writing', [
+			'channel' => $channelName,
+			'level'   => $this->normalizeLevel($level)->getName(),
+			'message' => $message,
+			'context' => $context,
+		]);
+
+		$logger->log($this->normalizeLevel($level), $message, $context);
+
+		if (php_sapi_name() === 'cli') {
+			echo '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL;
+		}
+
+		// Event: after write
+		$this->dispatch('logging.written', [
+			'channel' => $channelName,
+			'level'   => $this->normalizeLevel($level)->getName(),
+			'message' => $message,
+			'context' => $context,
+			'time'    => gmdate('c'),
+		]);
+	}
 
 	/**
-	 * Khởi tạo logger (một lần duy nhất)
+	 * @return MonologLogger
 	 */
-	protected static function boot(): void {
-		if (self::$logger) return;
-
-		self::$path = sys_get_temp_dir() . '/wpsp-logs';
-		if (!is_dir(self::$path)) mkdir(self::$path, 0777, true);
-
-		$file   = self::$path . '/' . self::$channel . '.log';
-		$logger = new MonologLogger(self::$channel);
-
-		// Handler: rotating file (daily)
-		$handler = new RotatingFileHandler($file, self::$days, MonologLogger::DEBUG, true);
-		$handler->setFormatter(new LineFormatter("[%datetime%] %level_name%: %message% %context%\n", 'Y-m-d H:i:s', true, true));
-
-		$logger->pushHandler($handler);
-		self::$logger = $logger;
+	public function get($channel) {
+		if (!isset($this->channels[$channel])) {
+			$this->channels[$channel] = $this->buildChannel($channel);
+			$this->selectedChannel = $channel;
+		}
+		return $this->channels[$channel];
 	}
 
-	public static function channel(string $name): self {
-		self::$channel = $name;
-		self::$logger  = null; // reset
-		self::boot();
-		return new static;
+	// ----------------------------------------------------------------------
+	// Builders
+	// ----------------------------------------------------------------------
+
+	/**
+	 * @return MonologLogger
+	 */
+	protected function buildChannel($channel) {
+		$config = $this->configFor($channel);
+
+		$name   = $config['name'] ?? $channel;
+		$logger = new MonologLogger($name);
+
+		$level     = $this->toLevel($config['level'] ?? $this->config['level'] ?? 'debug');
+		$formatter = $this->defaultFormatter();
+
+		$driver = $config['driver'] ?? 'single';
+
+		switch ($driver) {
+			case 'stack':
+				$channels = (array)($config['channels'] ?? $this->config['channels'] ?? []);
+				foreach ($channels as $child) {
+					$childLogger = $this->get($child);
+					foreach ($childLogger->getHandlers() as $h) {
+						$logger->pushHandler($h);
+					}
+				}
+				break;
+
+			case 'daily':
+				$path    = $this->resolveLogPath($config['path'] ?? null, $name);
+				$days    = (int)($config['days'] ?? 14);
+				$handler = new RotatingFileHandler($path, $days, $level, true, 0644);
+				$handler->setFormatter($formatter);
+				$logger->pushHandler($handler);
+				break;
+
+			case 'stderr':
+				$handler = new StreamHandler('php://stderr', $level, true);
+				$handler->setFormatter($formatter);
+				$logger->pushHandler($handler);
+				break;
+
+			case 'syslog':
+				$ident    = $config['ident'] ?? $name;
+				$facility = $config['facility'] ?? LOG_USER;
+				$handler  = new SyslogHandler($ident, $facility, $level, true);
+				$handler->setFormatter($formatter);
+				$logger->pushHandler($handler);
+				break;
+
+			case 'single':
+			default:
+				$path    = $this->resolveLogPath($config['path'] ?? null, $name);
+				$handler = new StreamHandler($path, $level, true, 0644);
+				$handler->setFormatter($formatter);
+				$logger->pushHandler($handler);
+				break;
+		}
+
+		return $logger;
 	}
 
-	public static function info(string $message, array $context = []): void {
-		self::boot();
-		self::$logger->info($message, $context);
+	/**
+	 * @return LineFormatter
+	 */
+	protected function defaultFormatter() {
+		// Format tương tự Laravel: "[%datetime%] %channel%.%level_name%: %message% %context% %extra%\n"
+		return new LineFormatter("[%datetime%] %channel%.%level_name%: %message% %context% %extra%\n", 'Y-m-d H:i:s', true, true);
 	}
 
-	public static function error(string $message, array $context = []): void {
-		self::boot();
-		self::$logger->error($message, $context);
+	protected function resolveLogPath($path, $channel) {
+		// Mặc định: storage/logs/wpsp.log hoặc <channel>.log
+		$base = $this->funcs->_getStoragePath('/logs');
+		if (!is_dir($base)) {
+			@mkdir($base, 0755, true);
+		}
+		$file = $path ?: ($channel . '.log');
+//		if (!preg_match('~^([a-zA-Z]:)?[\\/]|^php://~', $file)) {
+//			$file = rtrim($base, '/\\') . '/' . ltrim($file, '/\\');
+//		}
+		return $file;
 	}
 
-	public static function warning(string $message, array $context = []): void {
-		self::boot();
-		self::$logger->warning($message, $context);
+	// ----------------------------------------------------------------------
+	// Config + Helpers
+	// ----------------------------------------------------------------------
+
+	protected function loadConfig(): array {
+		$config = [];
+
+		try {
+			// Nếu có WPSP\Config('logging') thì merge
+			$cfg = $this->funcs->_config('logging');
+			if (is_array($cfg)) {
+				$config = array_replace_recursive($config, $cfg);
+			}
+		}
+		catch (\Throwable $ex) {
+			// bỏ qua
+		}
+
+		return $config;
 	}
 
-	public static function debug(string $message, array $context = []): void {
-		self::boot();
-		self::$logger->debug($message, $context);
+	protected function configFor($channel) {
+		$channels = $this->config['channels'] ?? [];
+		return $channels[$channel] ?? ['driver' => 'single', 'path' => $channel . '.log', 'level' => $this->config['level'] ?? 'debug'];
 	}
 
-	public static function critical(string $message, array $context = []): void {
-		self::boot();
-		self::$logger->critical($message, $context);
+	protected function toLevel($level) {
+		if ($level instanceof Level) return $level;
+		$map = [
+			'debug'     => Level::Debug,
+			'info'      => Level::Info,
+			'notice'    => Level::Notice,
+			'warning'   => Level::Warning,
+			'error'     => Level::Error,
+			'critical'  => Level::Critical,
+			'alert'     => Level::Alert,
+			'emergency' => Level::Emergency,
+		];
+		$key = strtolower((string)$level);
+		return $map[$key] ?? Level::Debug;
 	}
 
-	public static function getLogger(): MonologLogger {
-		self::boot();
-		return self::$logger;
+	protected function normalizeLevel($level) {
+		return $this->toLevel($level);
 	}
 
-	public static function setPath(string $path): void {
-		self::$path   = rtrim($path, '/');
-		self::$logger = null;
+	protected function makeDispatcher() {
+		try {
+			// Sử dụng WPSP\Funcs::event() -> trả về dispatcher
+			if (class_exists(\WPSP\Funcs::class)) {
+				return \WPSP\Funcs::event();
+			}
+		}
+		catch (\Throwable $ex) {
+		}
+		return null;
 	}
 
-	public static function setDays(int $days): void {
-		self::$days   = $days;
-		self::$logger = null;
+	protected function dispatch($event, $payload = []) {
+		try {
+			if ($this->events) {
+				$this->events->dispatch($event, $payload);
+			}
+		}
+		catch (\Throwable $ex) {
+			// không cản trở logging nếu event lỗi
+		}
+	}
+
+	/*
+	 *
+	 */
+
+	/**
+	 * @return static|null
+	 */
+	public function _channel($name = null) {
+		$this->get($name ?? $this->defaultChannel);
+		return $this;
+	}
+
+	public function _info($message, $context = []) {
+		$this->write('info', $message, $context);
+	}
+
+	public function _alert($message, $context = []) {
+		$this->write('alert', $message, $context);
+	}
+
+	public function _debug($message, $context = []) {
+		$this->write('debug', $message, $context);
+	}
+
+	public function _error($message, $context = []) {
+		$this->write('error', $message, $context);
+	}
+
+	public function _notice($message, $context = []) {
+		$this->write('notice', $message, $context);
+	}
+
+	public function _warning($message, $context = []) {
+		$this->write('warning', $message, $context);
+	}
+
+	public function _critical($message, $context = []) {
+		$this->write('critical', $message, $context);
+	}
+
+	public function _emergency($message, $context = []) {
+		$this->write('emergency', $message, $context);
+	}
+
+	public function _log($level, $message, $context = []) {
+		$this->write($level, $message, $context);
 	}
 
 }
